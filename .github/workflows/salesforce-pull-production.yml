@@ -1,0 +1,68 @@
+name: Salesforce Pull Production
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+concurrency: ${{ github.repository }}
+
+jobs:
+  source_retrieve:
+    # don't trigger on merge, because will could race condition with deploy job
+    if: github.event.pull_request.merged != true
+    name: Production Pull
+    runs-on: ubuntu-latest
+    steps:
+      - run: sudo apt-get update
+      - run: sudo apt-get install jq
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+      # sfdx force:source:retrieve will not remove local files if they're removed on the server
+      # clearing the folder means retrieve will only include files currently on the server
+      - run: rm -fr force-app/*
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install -g @salesforce/cli
+      - run: sf --version
+      # run `sf org display --verbose --json` and copy the sfdxAuthUrl value into the env var SFDX_AUTH_URL_PROD
+      - run: echo "${{ secrets.SFDX_AUTH_URL_PROD }}" | sf org login sfdx-url --sfdx-url-stdin -d -s -a target-org
+      # metadata types: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_unsupported_types.htm
+      - run: sf project retrieve start -w 60 --target-org target-org -m ApexClass -m CustomMetadata -m CustomObject -m ApexComponent -m ApexPage -m ApexTrigger -m AuraDefinitionBundle -m LightningComponentBundle -m StaticResource -m Flow -m Workflow -m ApprovalProcess -m AssignmentRules -m AutoResponseRules -m EmailTemplate -m layout -m flexipage -m customtab -m weblink -m validationrule -m customfield -m workflowrule -m QuickAction -m RemoteSiteSetting -m NamedCredential -m PermissionSet -m Profile
+      # get customizations on standard objects we care about (customize to the org)
+      - run: sf project retrieve start -w 60 --target-org target-org -m customobject:product2 -m customobject:opportunity -m customobject:opportunitylineitem -m customobject:pricebookentry -m customobject:pricebook2 -m customobject:account -m customobject:contact -m customobject:lead -m customobject:campaign -m customobject:case -m customobject:task  -m customobject:order -m customobject:orderitem -m customobject:sbqq__quote__c -m customobject:sbqq__quoteitem__c
+      # get currently active flows with their version numbers appended
+      - run: |
+          sf data query --query "SELECT DeveloperName, ActiveVersion.VersionNumber FROM FlowDefinition WHERE ActiveVersionId <> NULL AND NamespacePrefix = null" --use-tooling-api --json | jq -r '.result.records[] | "-m Flow:" + .DeveloperName + "-" + (.ActiveVersion.VersionNumber | tostring)' > temp_active_flows
+          sf project retrieve start -w 60 --target-org target-org $(cat temp_active_flows)
+          rm temp_active_flows
+          # replace draft flows with the currently active version (remove -<number> from filename)
+          for f in src/main/default/flows/*.flow-meta.xml; do
+            base=$(echo "$f" | sed -E 's/(-[0-9]+)(\.flow-meta\.xml)$/.flow-meta.xml/')
+            if [ "$f" != "$base" ]; then
+              mv "$f" "$base"
+            fi
+          done
+      # get email templates
+      - run: sf data query --target-org target-org --query "Select Folder.DeveloperName, DeveloperName from EmailTemplate where NamespacePrefix = null" --json | jq -r '.result.records[] | "-m EmailTemplate:" + (if .Folder.DeveloperName then .Folder.DeveloperName else "unfiled$public" end ) + "/" + .DeveloperName ' > temp_md_types
+      - run: cat temp_md_types
+      - run: sf project retrieve start --target-org target-org $( cat temp_md_types ) --json
+      - run: rm temp_md_types
+      # commit changes
+      - run: git status
+      - run: git diff
+      - run: |
+          if [[ -z $(git status -s) ]]
+          then
+            echo "SKIPPING COMMIT, NO CHANGES"
+            exit
+          fi
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git add -A
+          git commit -m "Salesforce Production Pull $(date)"
+          git push
