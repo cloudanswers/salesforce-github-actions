@@ -20,7 +20,7 @@ jobs:
       - run: sudo apt-get install jq
       - uses: actions/checkout@v4
         with:
-          ref: master
+          ref: main
       # sfdx force:source:retrieve will not remove local files if they're removed on the server
       # clearing the folder means retrieve will only include files currently on the server
       - run: rm -fr force-app/*
